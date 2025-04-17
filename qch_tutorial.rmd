@@ -1,0 +1,275 @@
+---
+title: "qch R package tutorial"
+editor: visual
+author: 
+  - Annaïg De Walsche
+date: last-modified
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  out.width = '70%'
+)
+```
+
+This tutorial explains how to use the [`{qch}` R package](https://cran.r-project.org/web/packages/qch/index.html) for jointly analyzing multiple sets of p-values, as described in [Mary-Huard et al. (2021)](https://doi.org/10.1093/bioinformatics/btab592) and [De Walsche et al. (2024)](https://doi.org/10.1101/2024.03.17.585412). The joint analysis of $K$ sets of p-values obtained for the same list of items, is performed by querying a composite hypothesis, i.e. an arbitrary complex combination of simple hypotheses. In this approach, the $K$-uplet of p-values associated with each item is distributed as a multivariate mixture, where each of the $2^K$ components corresponds to a specific combination of simple hypotheses.
+
+This script will walk through the steps for applying this methodology to genome-wide association studies (GWAS) results for Arabidopsis, under different environmental conditions.
+
+# Package installation
+
+To begin, install the `{qch}` package if you haven't already:
+
+```{r install qch package from git, warning=FALSE,message=FALSE}
+library(devtools)
+if (!require('qch')){
+  # install_github("annaigdw/qch")
+  install.packages("qch")
+}
+```
+
+Note that this package uses functions from the `qvalue` package, which is downloadable from [Bioconductor](https://www.bioconductor.org/packages/release/bioc/html/qvalue.html). If installation of `qch` fails and you have not yet installed the `qvalue` package, please try running the following commands:
+
+```{r install qvalue from Bioconductor,eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+  BiocManager::install("qvalue")
+  
+# install_github("annaigdw/qch")
+install.packages("qch")
+```
+
+Additionally, the following R packages are required for data processing and visualization:
+
+```{r dependencies,warning=FALSE,message=FALSE}
+library(tidyverse)
+library(data.table)
+library(metaGE)
+library(tictoc)
+library(qch)
+
+## For graphical displays
+library(corrplot)
+library(ggplot2)
+```
+
+# Download the data
+
+You can download the GWAS results from <https://doi.org/10.57745/XQ3P72>. After downloading, unzip the files into a folder named **cucumber_resistance_virus_GWAS**.
+
+The dataset comes from the experiment described in [Monnot et al.(2022)](https://doi.org/10.1093/hr/uhac184). In this study, a panel of 226 cucumber elite lines, 40 landraces and 23 hybrids were inoculated with six viruses (denoted CGMMV, CMV, CVYV, PRSV, WMV and ZYMV hereafter) to evaluate their responses. An individual GWAS was conducted on a number of SNPs ranging from $n=378,049$ to $n=424,393$ depending on the virus. The aim of the study was to identify QTLs associated with virus resistance in cucumber.
+
+# Build the dataset
+
+We'll begin by listing the files that contain the GWAS results for each environment and perform some data pre-processing.
+
+```{r listing files of GWAS results}
+## Get the folder containing the association file
+RepData <- "C:/Users/Annaig/Desktop/data/tutorials/cucumber_resistance_virus_GWAS/"
+
+## Get the complete list of association files
+File.list <- list.files(RepData ,full.names = TRUE) %>% 
+  .[str_detect(string = ., pattern = ".rds")] %>% 
+  tibble(Names = .)%>% 
+  mutate(ShortNames = Names %>%
+           str_remove(pattern = RepData) %>% str_remove(pattern = ".rds")) %>%
+  select(ShortNames,Names) %>% 
+  deframe
+
+File.list
+
+```
+
+```{r data pre-processing}
+invisible(map(1:length(File.list), function(i){
+  resGWAS <- readRDS(File.list[i])
+  Data <- resGWAS$pval_step[[1]]$out
+  Data <- Data %>% mutate(CHR = str_split_i(SNP,'_',2) %>% str_remove(.,pattern='Chr') %>% as.numeric,
+         POS = str_split_i(SNP,'_',3) %>% as.numeric) %>% select(SNP, CHR, POS, pval)
+  fwrite(Data,file = paste0(RepData,names(File.list)[i],".csv"))
+}))
+
+```
+
+```{r listing the new files of GWAS results}
+## Get the complete list of association files
+File.list <- list.files(RepData ,full.names = TRUE) %>% 
+  .[str_detect(string = ., pattern = ".csv")] %>% 
+  tibble(Names = .)%>% 
+  mutate(ShortNames = Names %>%
+           str_remove(pattern = RepData) %>% str_remove(pattern = "_GWAS19_GLM_oldMLMM_KQ9.csv")) %>%
+  select(ShortNames,Names) %>% 
+  deframe
+
+File.list
+
+```
+
+Let's take a look at the data from one of the files:
+
+```{r looking at single file }
+## Have a look at the first one
+fread(File.list[1]) %>% head() 
+```
+
+Next, we combine all the association results into a single dataset using the `metaGE.collect` function. Note that files might not contain the same set of SNPs, leading to missing data (NAs). By default, rows with NAs will be removed, but you can keep them by setting NA.rmv = FALSE.
+
+```{r metaGE collect}
+###Build the dataset
+## First provide the variable names of the file
+Names.list <- list(MARKER='SNP',
+                   CHR='CHR',
+                   POS='POS',
+                   PVAL='pval',EFFECT='pval')
+
+## For filtering on Maf
+MinFreq <- 0
+
+## Now collect
+MetaData <- metaGE.collect(FileNames = File.list, VariableNames = Names.list, MinFreq = MinFreq, DropDuplicates = FALSE)
+head(MetaData$Data)
+```
+
+# Filter the data
+
+Why filtering ? Have a look !
+
+```{r histograms pval}
+Virus <- MetaData$Data %>% select(contains("PVAL.")) %>% names()
+invisible(map(Virus, ~ pull(MetaData$Data,.x) %>% hist(.,100,main = .x)))
+```
+
+```{r Find the weirdos}
+
+idx.mode <- map(MetaData$Data %>% select(contains("PVAL")) , ~ .x %>% table %>% which.max)
+val.mode <- map(idx.mode, ~ names(.x) %>% as.numeric)
+Weird.chr <- map2_dbl(Virus,val.mode, ~ MetaData$Data %>% filter((!!as.symbol(.x))==.y) %>% 
+                   pull(CHR) %>% 
+                   unique)
+Weird.pos <- map2(Virus,val.mode, ~ MetaData$Data %>% filter((!!as.symbol(.x))==.y) %>%
+                        pull(POS) %>% range)
+
+Weird.chr
+Weird.pos
+#CCL: weird pvalues correspond to a single region in Chr2
+
+## Filtering
+MetaData$Data <- MetaData$Data  %>%
+  filter(!((CHR==Weird.chr[1])&(POS >= Weird.pos[[1]][1])&(POS <= Weird.pos[[1]][2])))
+```
+
+# Define the composite hypothesis
+
+You can generate all possible configurations of the simple hypotheses (H0/H1) using the `GetHconfig` function. Here, we consider $K = 6$ sets of p-values.
+
+```{r get Hconfig}
+K <- 6
+Hconfig <- GetHconfig(K)
+
+Hconfig[1:5]
+length(Hconfig)
+```
+
+We can specify which configurations among `Hconfig` correspond to the composite alternative hypothesis : {at least k H1 hypotheses are true} using the `GetH1AtLeast` function. Here, we define a composite hypothesis where at least three out of four H1 hypotheses are true.
+
+```{r get H1config}
+H1config_atleast2 <- GetH1AtLeast(Hconfig,AtLeast = 2)
+
+H1config_atleast2
+length(H1config_atleast2$AtLeast_2)
+```
+
+# Fit the mixture model
+
+You can fit different models depending on the `copula` argument in `qch.fit` :
+
+-   if `copula = 'indep'`, then the independence between the GWAS results is assumed (depreciated).
+
+-   if `copula ='gaussian'`, then the dependency between GWAS results is taken into account using a Gaussian copula.
+
+Below are examples using both Gaussian copula and independence models.
+
+```{r qch fit copula}
+## Build the matrix containing only the pvalues
+PvalMat <- MetaData$Data %>% select(contains("PVAL."))
+
+## Fitting the model
+tic()
+res.fit <- qch.fit(pValMat = PvalMat,Hconfig = Hconfig,copula = "gaussian")
+toc()
+```
+
+Let's visualize the estimated Gaussian copula correlation matrix:
+
+```{r}
+rownames(res.fit$Rcopula) <- colnames(res.fit$Rcopula)  <- names(File.list)
+corrplot(res.fit$Rcopula,addCoef.col = "red")
+```
+
+# Composite hypothesis testing
+
+One can perform any composite hypothesis test by specifying the configurations `Hconfig.H1` corresponding to the composite alternative hypothesis among all configurations `Hconfig`.
+
+By default, the function performs the composite hypothesis test of being associated with {at least $k$ analysis}, for $k = 1,...,K$.
+
+Here, we'll test whether {at least three hypotheses} hold true.
+
+```{r qch test atleast2}
+res.test.atleast2 <- qch.test(res.qch.fit = res.fit,Hconfig = Hconfig, Hconfig.H1 = H1config_atleast2,Alpha = 0.05)
+```
+
+Visualize the p-value distribution for this test:
+
+```{r pvalues distribution}
+##Check the pvalues
+par(mfrow=c(1,2))
+metaGE.pvalplot(res.test.atleast2$Pvalues$AtLeast_2)
+```
+
+Finally, let's list the significant markers at a 0.05 threshold:
+
+```{r candidates markers}
+MetaData$Data <- MetaData$Data %>% mutate(Pvalue_atleast2 = res.test.atleast2$Pvalues$AtLeast_2,
+                                          Rejection_atleast2 = res.test.atleast2$Rejection$AtLeast_2)
+
+MetaData$Data %>% filter(Rejection_atleast2 ==1) %>% head()
+```
+
+# Manhattan plot
+
+We can create a Manhattan plot to visualize the results using the `metaGE.manhattan`:
+
+```{r manhattan plot,fig.align='center',fig.height=6,fig.width=10}
+
+threshold_atleast2 <- MetaData$Data %>% filter(Rejection_atleast2==1) %>% pull(Pvalue_atleast2)%>% max %>% max(.,0)
+
+manhattan <- metaGE.manhattan(Data = MetaData$Data,VarName = 'Pvalue_atleast2', Threshold = threshold_atleast2 ,Main = '-log10(Pval) alongside the chromosome',Score = FALSE )
+print(manhattan)
+```
+
+# HeatMap
+
+We can create a heatmap to visualize the results using the `metaGE.heatmap`:
+
+```{r heatmap plot, fig.align='center',fig.height=10,fig.width=10}
+##heatmap at least 2 top 10
+heatmapDF <- MetaData$Data %>%  filter(Rejection_atleast2 ==1) %>% arrange(CHR, POS) %>% mutate_at(.vars = vars(matches('PVAL.')),.funs = list(~ -log10(.)))
+
+top10_chr5 <- heatmapDF %>% filter(CHR==5) %>% arrange(Pvalue_atleast2) %>% pull(MARKER) %>% .[1:10]
+top10_chr6 <- heatmapDF %>% filter(CHR==6 & POS <=14778600) %>% arrange(Pvalue_atleast2) %>% pull(MARKER) %>% .[1:10]
+top10_chr6_bis <- heatmapDF %>% filter(CHR==6 & POS >14778600) %>% arrange(Pvalue_atleast2) %>% pull(MARKER) %>% .[1:10]
+heatmapDF_top10 <- heatmapDF %>% 
+  filter(CHR==1 | CHR==2 | MARKER %in% top10_chr5 | MARKER %in% top10_chr6 | MARKER %in% top10_chr6_bis) %>% 
+  arrange(CHR, POS) %>% mutate(QTL=paste0("chr_",CHR))
+
+heatmapDF_top10$QTL[heatmapDF_top10$CHR==6 & heatmapDF_top10$POS >14778600] <- "chr6_26.1"
+heatmapDF_top10$QTL[heatmapDF_top10$CHR==6 & heatmapDF_top10$POS <=14778600] <- "chr6_8.8"
+heatmapDF_top10$QTL[heatmapDF_top10$CHR==1] <- "chr1_10.1"
+heatmapDF_top10$QTL[heatmapDF_top10$CHR==2] <- "chr2_1.3"
+heatmapDF_top10$QTL[heatmapDF_top10$CHR==5] <- "chr5_7.0"
+
+heatmap_plot <- metaGE.heatmap(Data = heatmapDF_top10, Prefix = "PVAL.",QTLsVarName = "QTL",Colors = c("white","blue","blue4"))
+
+```
