@@ -1,0 +1,1 @@
+This tutorial explains how to use the [`{qch}` R package](https://cran.r-project.org/web/packages/qch/index.html) for jointly analyzing multiple sets of p-values, as described in [Mary-Huard et al. (2021)](https://doi.org/10.1093/bioinformatics/btab592) and [De Walsche et al. (2024)](https://doi.org/10.1101/2024.03.17.585412).
